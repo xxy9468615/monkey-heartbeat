@@ -1,0 +1,57 @@
+name: Heartbeat Keepalive
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Task ID to keep alive'
+        required: true
+        type: string
+      mode:
+        description: 'Keepalive mode (ws/poll/dual)'
+        required: false
+        default: 'ws'
+        type: choice
+        options:
+          - ws
+          - poll
+          - dual
+      duration:
+        description: 'Duration in minutes'
+        required: false
+        default: '60'
+        type: number
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install websockets
+
+      - name: Run keepalive
+        run: |
+          echo "Running keepalive for ${{ inputs.duration }} minutes..."
+          timeout ${{ inputs.duration }}m \
+            python scripts/heartbeat_keepalive.py \
+              --task-id "${{ inputs.task_id }}" \
+              --mode "${{ inputs.mode }}" \
+              --interval 10 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-logs
+          path: outputs/keepalive.log
