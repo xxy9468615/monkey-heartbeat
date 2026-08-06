@@ -38,7 +38,16 @@ tail -f outputs/keepalive.log
 
 Workflow is in `.github/workflows/keepalive.yml`. Triggers via `workflow_dispatch` with inputs: `task_id`, `mode`, `duration`. Job has a 120-minute hard timeout and a `timeout` command matching the user-supplied duration. Logs uploaded as artifacts.
 
-## Test Run Results
+## Ignored Files (per .gitignore)
+
+- `monkeycode-ai.com.har` and all `*.har` files — large capture data, excluded from git
+- `outputs/keepalive.log` — runtime logs (excluded to avoid commit noise; can be force-added for archiving)
+- `__pycache__/`, `*.pyc`, `*.pyo`, `*.egg-info/`, `.eggs/` — Python cache/artifacts
+- `.vscode/`, `.idea/` — IDE settings
+- `.DS_Store`, `Thumbs.db` — OS metadata
+- `.env` — sensitive credentials
+
+When creating or editing files, do not commit anything matching the patterns above. If a log file needs to be preserved (e.g., test evidence), use `git add -f`.
 
 30-minute dual-mode test completed successfully:
 - WS pings: 160 sent / 160 received
