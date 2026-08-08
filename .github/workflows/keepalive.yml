@@ -22,8 +22,8 @@ on:
         default: '60'
         type: number
       cookie:
-        description: 'Browser auth cookie'
-        required: true
+        description: 'Browser auth cookie (overrides secret)'
+        required: false
         type: string
 
 jobs:
@@ -45,13 +45,15 @@ jobs:
           pip install websockets
 
       - name: Run keepalive
+        env:
+          COOKIE: ${{ inputs.cookie || secrets.KEEPALIVE_COOKIE }}
         run: |
           echo "Running keepalive for ${{ inputs.duration }} minutes..."
           timeout ${{ inputs.duration }}m \
             python scripts/heartbeat_keepalive.py \
               --task-id "${{ inputs.task_id }}" \
               --mode "${{ inputs.mode }}" \
-              --cookie "${{ inputs.cookie }}" \
+              --cookie "$COOKIE" \
               --interval 10 || true
 
       - name: Upload logs
