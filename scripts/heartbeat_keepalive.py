@@ -36,6 +36,16 @@ from urllib.parse import urlencode
 import websockets
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, InvalidStatus
 
+# Load .env file if present (for local runs)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _, _val = _line.partition("=")
+                os.environ.setdefault(_key.strip(), _val.strip())
+
 # Add configs directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs"))
 from keepalive_config import (
