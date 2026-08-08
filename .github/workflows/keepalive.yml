@@ -21,6 +21,10 @@ on:
         required: false
         default: '60'
         type: number
+      cookie:
+        description: 'Browser auth cookie'
+        required: true
+        type: string
 
 jobs:
   keepalive:
@@ -47,6 +51,7 @@ jobs:
             python scripts/heartbeat_keepalive.py \
               --task-id "${{ inputs.task_id }}" \
               --mode "${{ inputs.mode }}" \
+              --cookie "${{ inputs.cookie }}" \
               --interval 10 || true
 
       - name: Upload logs
