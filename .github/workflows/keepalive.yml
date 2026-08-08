@@ -17,19 +17,28 @@ on:
           - poll
           - dual
       duration:
-        description: 'Duration in minutes'
+        description: 'Duration per run in minutes (max 350, auto-chains)'
         required: false
-        default: '60'
+        default: '350'
         type: number
       cookie:
         description: 'Browser auth cookie (overrides secret)'
         required: false
         type: string
+      auto_restart:
+        description: 'Auto-restart when duration expires (chain runs)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,16 +58,31 @@ jobs:
           COOKIE: ${{ inputs.cookie || secrets.KEEPALIVE_COOKIE }}
         run: |
           echo "Running keepalive for ${{ inputs.duration }} minutes..."
+          echo "Auto-restart: ${{ inputs.auto_restart }}"
           timeout ${{ inputs.duration }}m \
             python scripts/heartbeat_keepalive.py \
               --task-id "${{ inputs.task_id }}" \
               --mode "${{ inputs.mode }}" \
               --cookie "$COOKIE" \
+              --duration "${{ inputs.duration }}" \
               --interval 10 || true
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: keepalive-logs
+          name: keepalive-logs-${{ github.run_id }}
           path: outputs/keepalive.log
+
+      - name: Chain next run
+        if: ${{ inputs.auto_restart }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Chaining next keepalive run..."
+          gh workflow run keepalive.yml \
+            -f task_id="${{ inputs.task_id }}" \
+            -f mode="${{ inputs.mode }}" \
+            -f duration="${{ inputs.duration }}" \
+            -f auto_restart="true"
+          echo "Next run triggered successfully."
