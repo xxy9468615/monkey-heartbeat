@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import websockets
+import aiohttp
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, InvalidStatus
 
 # Load .env file if present (for local runs)
@@ -166,6 +167,9 @@ async def websocket_keepalive(task_id: str, interval: float = PING_INTERVAL,
                 ws_url,
                 additional_headers=headers,
                 ping_interval=None,  # Disable auto-ping, we do manual pings
+                ping_timeout=None,   # Disable connection timeout ping
+                max_queue=1000,      # Prevent message queue overflow
+                close_timeout=10,    # Faster graceful close
             ) as websocket:
                 logger.info(f"[WS] Connected. Sending ping every {interval}s...")
                 attempt = 0  # Reset on successful connection
@@ -183,22 +187,18 @@ async def websocket_keepalive(task_id: str, interval: float = PING_INTERVAL,
                     await asyncio.sleep(interval)
                     ping_count += 1
 
-                    # Check if connection is still alive
-                    try:
-                        if websocket.closecode is not None:
-                            logger.warning(f"[WS] Connection closed with code {websocket.closecode}")
-                            break
-                    except Exception:
-                        pass
+                    if not await send_ping(websocket, task_id, ping_count):
+                        logger.warning("[WS] Ping failed, breaking to reconnect")
+                        break
 
-                    await send_ping(websocket, task_id, ping_count)
-
-                    # Try to receive any pending messages (non-blocking with timeout)
+                    # Receive all pending messages (non-blocking with timeout)
+                    recv_timeout = min(interval * 0.3, 2.0)  # Max 2s wait
                     try:
-                        msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                        await handle_ws_message(websocket, msg)
+                        async with asyncio.timeout(recv_timeout):
+                            async for msg in websocket:
+                                await handle_ws_message(websocket, msg)
                     except asyncio.TimeoutError:
-                        pass  # No message available, continue to next ping
+                        pass  # No more messages
 
         except (ConnectionClosed, ConnectionClosedError) as e:
             logger.warning(f"[WS] Connection closed: {e}. Reconnecting in {backoff}s...")
@@ -223,48 +223,43 @@ async def http_polling_keepalive(task_id: str, interval: float = POLL_INTERVAL,
                                   duration: float = 0, cookie: str = ""):
     """
     HTTP polling fallback: periodically poll task status endpoint.
-    Uses urllib for HTTPS (no external HTTP library dependency).
+    Uses aiohttp for non-blocking async HTTP requests.
     """
-    import urllib.request
-    import ssl
-
     poll_path = POLL_TASK_PATH.format(task_id=task_id)
     poll_url = f"https://monkeycode-ai.com{poll_path}"
     ping_count = 0
     start_time = time.time()
 
-    while True:
-        # Check duration limit
-        if duration > 0:
-            elapsed_min = (time.time() - start_time) / 60
-            if elapsed_min >= duration:
-                logger.info(f"[HTTP] Duration limit ({duration}min) reached. Stopping.")
-                return
+    # Disable SSL verification (matching original behavior)
+    ssl_ctx = aiohttp.TCPConnector(ssl=False)
 
-        ping_count += 1
-        try:
-            await asyncio.sleep(interval)
+    headers = {
+        "User-Agent": REQUEST_HEADERS["User-Agent"],
+        "Accept": "*/*",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
 
-            # Build request
-            req = urllib.request.Request(poll_url)
-            req.add_header("User-Agent", REQUEST_HEADERS["User-Agent"])
-            req.add_header("Accept", "*/*")
-            if cookie:
-                req.add_header("Cookie", cookie)
+    async with aiohttp.ClientSession(connector=ssl_ctx) as session:
+        while True:
+            # Check duration limit
+            if duration > 0:
+                elapsed_min = (time.time() - start_time) / 60
+                if elapsed_min >= duration:
+                    logger.info(f"[HTTP] Duration limit ({duration}min) reached. Stopping.")
+                    return
 
-            # Use unverified SSL context for compatibility
-            ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
+            ping_count += 1
+            try:
+                await asyncio.sleep(interval)
 
-            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
-                status = resp.status
-                body = resp.read()
-                logger.info(f"[HTTP] Poll #{ping_count}: HTTP {status} | {len(body)} bytes")
+                async with session.get(poll_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    body = await resp.read()
+                    logger.info(f"[HTTP] Poll #{ping_count}: HTTP {resp.status} | {len(body)} bytes")
 
-        except Exception as e:
-            logger.error(f"[HTTP] Poll #{ping_count} failed: {e}")
-            await asyncio.sleep(min(interval * 2, RECONNECT_BACKOFF_MAX))
+            except Exception as e:
+                logger.error(f"[HTTP] Poll #{ping_count} failed: {e}")
+                await asyncio.sleep(min(interval * 2, RECONNECT_BACKOFF_MAX))
 
 
 async def dual_keepalive(task_id: str, ws_interval: float = PING_INTERVAL,
@@ -272,23 +267,40 @@ async def dual_keepalive(task_id: str, ws_interval: float = PING_INTERVAL,
                           duration: float = 0, cookie: str = ""):
     """
     Run WebSocket ping and HTTP polling concurrently for maximum reliability.
-    WebSocket is primary, HTTP polling is fallback.
+    WebSocket is primary, HTTP polling is fallback. Both must complete to stop.
     """
     ws_task = asyncio.create_task(
-        websocket_keepalive(task_id, ws_interval, duration, cookie)
+        websocket_keepalive(task_id, ws_interval, duration, cookie),
+        name="ws-keepalive"
     )
     poll_task = asyncio.create_task(
-        http_polling_keepalive(task_id, poll_interval, duration, cookie)
+        http_polling_keepalive(task_id, poll_interval, duration, cookie),
+        name="http-keepalive"
     )
 
-    done, pending = await asyncio.wait(
-        {ws_task, poll_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    try:
+        # Wait for BOTH to complete (or one to raise exception)
+        done, pending = await asyncio.wait(
+            {ws_task, poll_task},
+            return_when=asyncio.ALL_COMPLETED,
+        )
 
-    # Cancel remaining tasks
-    for task in pending:
-        task.cancel()
+        # Log results
+        for task in done:
+            if task.exception():
+                logger.error(f"[{task.get_name()}] Failed: {task.exception()}")
+            else:
+                logger.info(f"[{task.get_name()}] Completed successfully")
+
+    finally:
+        # Ensure all tasks are cancelled
+        for task in [ws_task, poll_task]:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
 def parse_args():
@@ -312,6 +324,52 @@ def parse_args():
     return parser.parse_args()
 
 
+async def async_main(args):
+    """Async main entry point with proper signal handling."""
+    shutdown_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info(f"Shutdown signal received. Stopping gracefully...")
+        shutdown_event.set()
+
+    # Setup signal handlers
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(sig, signal_handler)
+
+    # Run keepalive based on mode
+    if args.mode == "ws":
+        task = asyncio.create_task(
+            websocket_keepalive(args.task_id, args.interval, args.duration, args.cookie)
+        )
+    elif args.mode == "poll":
+        task = asyncio.create_task(
+            http_polling_keepalive(args.task_id, args.interval, args.duration, args.cookie)
+        )
+    elif args.mode == "dual":
+        task = asyncio.create_task(
+            dual_keepalive(args.task_id, args.interval, args.interval, args.duration, args.cookie)
+        )
+    else:
+        logger.error(f"Unknown mode: {args.mode}")
+        return
+
+    # Wait for either task completion or shutdown signal
+    done, pending = await asyncio.wait(
+        {task, asyncio.create_task(shutdown_event.wait())},
+        return_when=asyncio.FIRST_COMPLETED
+    )
+
+    # Cancel remaining tasks
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    logger.info("Shutdown complete.")
+
+
 def main():
     """Main entry point."""
     args = parse_args()
@@ -328,33 +386,13 @@ def main():
     logger.info(f"  WS URL: {get_ws_url(args.task_id)}")
     logger.info(f"  Poll URL: {get_poll_url(args.task_id)}")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    # Setup signal handlers for clean shutdown
-    def signal_handler(sig, frame):
-        logger.info(f"\nReceived signal {sig}. Shutting down...")
-        for task in asyncio.all_tasks(loop):
-            loop.create_task(task.cancel())
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     try:
-        if args.mode == "ws":
-            loop.run_until_complete(
-                websocket_keepalive(args.task_id, args.interval, args.duration, args.cookie)
-            )
-        elif args.mode == "poll":
-            loop.run_until_complete(
-                http_polling_keepalive(args.task_id, args.interval, args.duration, args.cookie)
-            )
-        elif args.mode == "dual":
-            loop.run_until_complete(
-                dual_keepalive(args.task_id, args.interval, args.interval, args.duration, args.cookie)
-            )
-    finally:
-        loop.close()
+        asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
